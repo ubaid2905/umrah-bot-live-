@@ -172,7 +172,7 @@ app.post('/api/log-activity', async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
-});
+
 
 // ── Health check route ────────────────────────────────────────────────────────
 // Useful to confirm your server is alive
