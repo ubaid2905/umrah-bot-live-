@@ -1,193 +1,346 @@
-// index.js
-// Main server — the heart of the bot
-
+// index.js — Bot + Dashboard merged into one server
 require('dotenv').config();
-const express = require('express');
+const express  = require('express');
 const mongoose = require('mongoose');
-const { getSession, addToHistory } = require('./sessions');
-const { getAIResponse } = require('./ai');
-const { sendTextMessage } = require('./whatsapp');
+const path     = require('path');
+const jwt      = require('jsonwebtoken');
+const bcrypt   = require('bcryptjs');
 
-// Import Activity model for logging
-const Activity = require('./dashboard/backend/models/Activity');
+const { getAIResponse }    = require('./ai');
+const { sendTextMessage }  = require('./whatsapp');
+const Activity             = require('./dashboard/backend/models/Activity');
+const User                 = require('./dashboard/backend/models/User');
 
 const app = express();
-
-// Connect to MongoDB
-if (process.env.MONGODB_URI) {
-  mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/umrah-bot-dashboard', {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-  })
-  .then(() => console.log('✅ Connected to MongoDB for logging'))
-  .catch(err => console.error('⚠️  MongoDB connection warning:', err.message));
-}
-
-// Parse incoming JSON from Meta's webhook
 app.use(express.json());
 
-// ── ROUTE 1: Webhook Verification ─────────────────────────────────────────────
-// When you register your webhook in Meta's dashboard, Meta sends a GET
-// request to verify you own the server. This handles that.
-app.get('/webhook', (req, res) => {
-  const mode      = req.query['hub.mode'];
-  const token     = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
+// ── Serve dashboard frontend ──────────────────────────────────────────────────
+app.use(express.static(path.join(__dirname, 'dashboard/frontend')));
 
-  console.log('🔔 Webhook verification attempt received');
+// ── Connect to MongoDB ────────────────────────────────────────────────────────
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('✅ MongoDB connected'))
+  .catch(err => { console.error('❌ MongoDB error:', err); process.exit(1); });
 
-  if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
-    // Verification passed — send the challenge back to Meta
-    console.log('✅ Webhook verified successfully!');
-    res.status(200).send(challenge);
-  } else {
-    // Wrong token — reject
-    console.error('❌ Webhook verification failed — wrong token');
-    res.sendStatus(403);
-  }
-});
-
-// ── ROUTE 2: Incoming Messages ────────────────────────────────────────────────
-// Every time a customer sends a WhatsApp message, Meta sends a POST here
-app.post('/webhook', async (req, res) => {
-
-  // CRITICAL: Always respond 200 to Meta immediately
-  // If you don't, Meta will retry the same message repeatedly
-  res.sendStatus(200);
-
+// ── JWT auth middleware ───────────────────────────────────────────────────────
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header) return res.status(401).json({ message: 'No token' });
   try {
-    const body = req.body;
+    req.user = jwt.verify(header.split(' ')[1], process.env.JWT_SECRET || 'umrah_jwt_secret');
+    next();
+  } catch {
+    res.status(401).json({ message: 'Invalid token' });
+  }
+}
 
-    // Validate the structure — Meta sends many event types, we only want messages
-    if (
-      !body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]
-    ) {
-      return; // Not a message event, ignore silently
-    }
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// AUTH ROUTES
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    const value   = body.entry[0].changes[0].value;
-    const message = value.messages[0];
-    const from    = message.from; // Customer's phone number e.g. "923001234567"
-
-    // ── Only handle text messages for now ────────────────────────────────────
-    if (message.type !== 'text') {
-      await sendTextMessage(
-        from,
-        'I can currently read text messages only. Please type your question ' +
-        'and I will be happy to help! 😊'
-      );
-      return;
-    }
-
-    const incomingText = message.text.body.trim();
-    console.log(`\n📩 New message from ${from}: "${incomingText}"`);
-
-    // ── Check for escalation keywords ────────────────────────────────────────
-    const escalationKeywords = [
-      'agent', 'human', 'manager', 'complaint', 'refund',
-      'urgent', 'problem', 'انسان', 'شکایت', 'فوری', 'مسئلہ'
-    ];
-    const needsHuman = escalationKeywords.some(
-      keyword => incomingText.toLowerCase().includes(keyword)
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password)
+      return res.status(400).json({ message: 'Username and password required' });
+    const exists = await User.findOne({ username });
+    if (exists)
+      return res.status(400).json({ message: 'Username already taken' });
+    const hash = await bcrypt.hash(password, 10);
+    const user = await User.create({ username, password: hash, role: 'agent' });
+    const token = jwt.sign(
+      { id: user._id, username: user.username, role: user.role },
+      process.env.JWT_SECRET || 'umrah_jwt_secret',
+      { expiresIn: '7d' }
     );
-
-    if (needsHuman) {
-      console.log(`🚨 Escalation triggered for ${from}`);
-      await sendTextMessage(
-        from,
-        'I understand you need immediate assistance. I am connecting you ' +
-        'with one of our consultants right now, please hold for just a moment.\n\n' +
-        'You can also reach us directly:\n' +
-        '📞 +92-300-1234567\n' +
-        '🕐 Mon–Sat, 9am–7pm PKT'
-      );
-      // TODO: Here you can add a Slack/email notification to alert your team
-      return;
-    }
-
-    // ── Get the customer's conversation history ───────────────────────────────
-    const session = getSession(from);
-
-    // Save their incoming message to history
-    addToHistory(from, 'user', incomingText);
-
-    // ── Get AI response ───────────────────────────────────────────────────────
-    // Pass history MINUS the last message (since getAIResponse adds it)
-    const historyToSend = session.history.slice(0, -1);
-    console.log(`💭 Asking AI (history length: ${historyToSend.length} messages)`);
-
-    const startTime = Date.now();
-    const aiReply = await getAIResponse(historyToSend, incomingText);
-    const responseTime = Date.now() - startTime;
-
-    // Save AI response to history
-    addToHistory(from, 'assistant', aiReply);
-
-    // ── Log activity to MongoDB ───────────────────────────────────────────────
-    if (mongoose.connection.readyState === 1) {
-      try {
-        const activity = new Activity({
-          phoneNumber: from,
-          userMessage: incomingText,
-          botResponse: aiReply,
-          metadata: {
-            responseTime: responseTime
-          }
-        });
-        await activity.save();
-      } catch (logErr) {
-        console.warn('⚠️  Failed to log activity:', logErr.message);
-      }
-    }
-
-    // ── Send reply back to customer ───────────────────────────────────────────
-    await sendTextMessage(from, aiReply);
-    console.log(`✅ Reply sent to ${from}`);
-
-  } catch (error) {
-    console.error('❌ Webhook handler crashed:', error.message);
-    console.error(error.stack);
-  }
-});
-
-// ── Activity Logging Endpoint (called by dashboard) ────────────────────────────
-app.post('/api/log-activity', async (req, res) => {
-  try {
-    const { phoneNumber, userMessage, botResponse, responseTime } = req.body;
-
-    if (!mongoose.connection.readyState === 1) {
-      return res.status(503).json({ message: 'Database not connected' });
-    }
-
-    const activity = new Activity({
-      phoneNumber,
-      userMessage,
-      botResponse,
-      metadata: { responseTime }
-    });
-
-    await activity.save();
-    res.status(201).json({ message: 'Activity logged' });
+    res.json({ token, username: user.username, role: user.role });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const user = await User.findOne({ username });
+    if (!user || !(await bcrypt.compare(password, user.password)))
+      return res.status(401).json({ message: 'Wrong username or password' });
+    const token = jwt.sign(
+      { id: user._id, username: user.username, role: user.role },
+      process.env.JWT_SECRET || 'umrah_jwt_secret',
+      { expiresIn: '7d' }
+    );
+    res.json({ token, username: user.username, role: user.role });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
 
-// ── Health check route ────────────────────────────────────────────────────────
-// Useful to confirm your server is alive
-app.get('/', (req, res) => {
-  res.json({
-    status: 'running',
-    bot: 'Umrah Travel Bot',
-    provider: process.env.AI_PROVIDER || 'gemini',
-    uptime: `${Math.floor(process.uptime())} seconds`
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DASHBOARD API ROUTES
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// GET /api/stats — summary numbers for the dashboard home
+app.get('/api/stats', requireAuth, async (req, res) => {
+  try {
+    const total    = await Activity.countDocuments();
+    const paused   = await Activity.countDocuments({ isPaused: true });
+    const active   = await Activity.countDocuments({ isPaused: false });
+    const today    = new Date(); today.setHours(0,0,0,0);
+    const newToday = await Activity.countDocuments({ firstSeen: { $gte: today } });
+    const msgSum   = await Activity.aggregate([
+      { $group: { _id: null, total: { $sum: '$messageCount' } } }
+    ]);
+    res.json({
+      totalCustomers: total,
+      activeChats:    active,
+      pausedChats:    paused,
+      newToday:       newToday,
+      totalMessages:  msgSum[0]?.total || 0
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// GET /api/customers — list all customers, sorted by last active
+app.get('/api/customers', requireAuth, async (req, res) => {
+  try {
+    const customers = await Activity.find()
+      .select('phoneNumber customerName status isPaused lastMessage lastActive messageCount firstSeen pausedBy')
+      .sort({ lastActive: -1 });
+    res.json(customers);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// GET /api/customers/:phone — full conversation for one customer
+app.get('/api/customers/:phone', requireAuth, async (req, res) => {
+  try {
+    const customer = await Activity.findOne({ phoneNumber: req.params.phone });
+    if (!customer) return res.status(404).json({ message: 'Customer not found' });
+    res.json(customer);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// PATCH /api/customers/:phone — update customer name or status
+app.patch('/api/customers/:phone', requireAuth, async (req, res) => {
+  try {
+    const { customerName, status } = req.body;
+    const updated = await Activity.findOneAndUpdate(
+      { phoneNumber: req.params.phone },
+      { $set: { customerName, status } },
+      { new: true }
+    );
+    res.json(updated);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// POST /api/customers/:phone/pause — agent takes over, bot stops
+app.post('/api/customers/:phone/pause', requireAuth, async (req, res) => {
+  try {
+    const updated = await Activity.findOneAndUpdate(
+      { phoneNumber: req.params.phone },
+      { $set: { isPaused: true, pausedBy: req.user.username, pausedAt: new Date(), status: 'paused' } },
+      { new: true }
+    );
+    console.log(`⏸️  Bot paused for ${req.params.phone} by ${req.user.username}`);
+    res.json({ ok: true, customer: updated });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// POST /api/customers/:phone/resume — hand back to bot
+app.post('/api/customers/:phone/resume', requireAuth, async (req, res) => {
+  try {
+    const updated = await Activity.findOneAndUpdate(
+      { phoneNumber: req.params.phone },
+      { $set: { isPaused: false, pausedBy: null, pausedAt: null, status: 'active' } },
+      { new: true }
+    );
+    console.log(`▶️  Bot resumed for ${req.params.phone} by ${req.user.username}`);
+    res.json({ ok: true, customer: updated });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// POST /api/customers/:phone/reply — agent sends a manual WhatsApp message
+app.post('/api/customers/:phone/reply', requireAuth, async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message) return res.status(400).json({ message: 'Message required' });
+
+    // Send via WhatsApp API
+    await sendTextMessage(req.params.phone, message);
+
+    // Save to conversation thread
+    await Activity.findOneAndUpdate(
+      { phoneNumber: req.params.phone },
+      {
+        $push: { messages: { role: 'agent', content: message } },
+        $set:  { lastMessage: message, lastActive: new Date() },
+        $inc:  { messageCount: 1 }
+      }
+    );
+    console.log(`👤 Agent ${req.user.username} replied to ${req.params.phone}: ${message}`);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// WHATSAPP WEBHOOK
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+app.get('/webhook', (req, res) => {
+  const mode      = req.query['hub.mode'];
+  const token     = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
+    console.log('✅ Webhook verified');
+    res.status(200).send(challenge);
+  } else {
+    res.sendStatus(403);
+  }
+});
+
+// Deduplication set — prevents double replies if Meta retries
+const processedMessages = new Set();
+
+app.post('/webhook', (req, res) => {
+  // Always reply 200 immediately so Meta never retries
+  res.sendStatus(200);
+
+  setImmediate(async () => {
+    try {
+      const body = req.body;
+      if (!body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) return;
+
+      const value   = body.entry[0].changes[0].value;
+      const message = value.messages[0];
+      const from    = message.from;
+
+      // Dedup check
+      if (processedMessages.has(message.id)) return;
+      processedMessages.add(message.id);
+      setTimeout(() => processedMessages.delete(message.id), 10 * 60 * 1000);
+
+      // Only handle text
+      if (message.type !== 'text') {
+        await sendTextMessage(from, 'I can read text messages only. Please type your question 😊');
+        return;
+      }
+
+      const incomingText = message.text.body.trim();
+      console.log(`\n📩 From ${from}: "${incomingText}"`);
+
+      // ── Check if bot is paused for this customer ──────────────────────────
+      const customerRecord = await Activity.findOne({ phoneNumber: from });
+      if (customerRecord?.isPaused) {
+        console.log(`⏸️  Bot is paused for ${from} — message saved, not replying`);
+        // Still save the message so agent can see it
+        await Activity.findOneAndUpdate(
+          { phoneNumber: from },
+          {
+            $push: { messages: { role: 'user', content: incomingText } },
+            $set:  { lastMessage: incomingText, lastActive: new Date() },
+            $inc:  { messageCount: 1 }
+          }
+        );
+        return; // Agent is handling — bot stays silent
+      }
+
+      // ── Escalation keywords ───────────────────────────────────────────────
+      const escalationKeywords = [
+        'agent','human','manager','complaint','refund',
+        'urgent','problem','انسان','شکایت','فوری','مسئلہ'
+      ];
+      const needsHuman = escalationKeywords.some(
+        kw => incomingText.toLowerCase().includes(kw)
+      );
+
+      if (needsHuman) {
+        await sendTextMessage(from,
+          'I understand you need immediate help. Connecting you with our team now.\n\n' +
+          '📞 +92-300-1234567\n🕐 Mon–Sat, 9am–7pm PKT'
+        );
+        // Auto-pause bot and flag for agent
+        await Activity.findOneAndUpdate(
+          { phoneNumber: from },
+          {
+            $push: { messages: { role: 'user', content: incomingText } },
+            $set:  { isPaused: true, pausedBy: 'auto-escalation', status: 'paused',
+                     lastMessage: incomingText, lastActive: new Date() },
+            $inc:  { messageCount: 1 }
+          },
+          { upsert: true }
+        );
+        return;
+      }
+
+      // ── Get conversation history for this customer ────────────────────────
+      const history = (customerRecord?.messages || [])
+        .slice(-20)
+        .map(m => ({ role: m.role === 'bot' ? 'assistant' : 'user', content: m.content }));
+
+      // ── Get AI reply ──────────────────────────────────────────────────────
+      const start   = Date.now();
+      const aiReply = await getAIResponse(history, incomingText);
+      const elapsed = Date.now() - start;
+
+      // ── Save both messages to MongoDB ─────────────────────────────────────
+      await Activity.findOneAndUpdate(
+        { phoneNumber: from },
+        {
+          $push: { messages: { $each: [
+            { role: 'user',  content: incomingText },
+            { role: 'bot',   content: aiReply }
+          ]}},
+          $set: {
+            lastMessage:  aiReply.substring(0, 80),
+            lastActive:   new Date(),
+            status:       'active',
+            'metadata.responseTime': elapsed
+          },
+          $inc: { messageCount: 2 }
+        },
+        { upsert: true, new: true }
+      );
+
+      // ── Send reply to customer ────────────────────────────────────────────
+      await sendTextMessage(from, aiReply);
+      console.log(`✅ Replied to ${from} in ${elapsed}ms`);
+
+    } catch (err) {
+      console.error('❌ Webhook error:', err.message);
+    }
   });
 });
 
-// ── Start the server ──────────────────────────────────────────────────────────
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get('/api/health', (req, res) => res.json({
+  status: 'running',
+  bot: 'Umrah Travel Bot',
+  ai: process.env.AI_PROVIDER || 'gemini',
+  uptime: `${Math.floor(process.uptime())}s`
+}));
+
+// ── Serve dashboard for all other routes ──────────────────────────────────────
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'dashboard/frontend/index.html'));
+});
+
+// ── Start server ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('🕌  Umrah Travel Bot — STARTED');
   console.log(`🌐  Port: ${PORT}`);
