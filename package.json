@@ -4,18 +4,20 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-  "start": "node index.js",
-  "dev": "nodemon index.js"
-},
-"keywords": [],
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "axios": "^1.16.1",
+    "bcryptjs": "^3.0.3",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
     "mongoose": "^8.1.1"
   },
   "devDependencies": {
