@@ -440,10 +440,9 @@ app.get('/api/health', (req, res) => res.json({
 }));
 
 // Serve dashboard for all other routes
-app.get('*', (req, res) => {
+app.get(/(.*)/, (req, res) => {
   res.sendFile(path.join(__dirname, 'dashboard/frontend/index.html'));
 });
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
