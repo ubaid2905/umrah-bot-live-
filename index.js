@@ -1,4 +1,4 @@
-// index.js — Bot + Dashboard merged into one server
+// index.js — Bot + Dashboard — single server
 require('dotenv').config();
 const express  = require('express');
 const mongoose = require('mongoose');
@@ -6,104 +6,200 @@ const path     = require('path');
 const jwt      = require('jsonwebtoken');
 const bcrypt   = require('bcryptjs');
 
-const { getAIResponse }    = require('./ai');
-const { sendTextMessage }  = require('./whatsapp');
-const Activity             = require('./dashboard/backend/models/Activity');
-const User                 = require('./dashboard/backend/models/User');
+const { getAIResponse }   = require('./ai');
+const { sendTextMessage } = require('./whatsapp');
+const Activity            = require('./dashboard/backend/models/Activity');
+const User                = require('./dashboard/backend/models/User');
 
 const app = express();
 app.use(express.json());
-
-// ── Serve dashboard frontend ──────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'dashboard/frontend')));
 
-// ── Connect to MongoDB ────────────────────────────────────────────────────────
+// ── MongoDB ───────────────────────────────────────────────────────────────────
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('✅ MongoDB connected'))
-  .catch(err => { console.error('❌ MongoDB error:', err); process.exit(1); });
+  .catch(err => { console.error('❌ MongoDB error:', err.message); process.exit(1); });
 
-// ── JWT auth middleware ───────────────────────────────────────────────────────
+const JWT_SECRET = process.env.JWT_SECRET || 'umrah_jwt_secret_change_this';
+
+// ── Auth middleware ───────────────────────────────────────────────────────────
 function requireAuth(req, res, next) {
   const header = req.headers.authorization;
-  if (!header) return res.status(401).json({ message: 'No token' });
+  if (!header?.startsWith('Bearer '))
+    return res.status(401).json({ message: 'No token provided' });
   try {
-    req.user = jwt.verify(header.split(' ')[1], process.env.JWT_SECRET || 'umrah_jwt_secret');
+    req.user = jwt.verify(header.split(' ')[1], JWT_SECRET);
     next();
   } catch {
-    res.status(401).json({ message: 'Invalid token' });
+    res.status(401).json({ message: 'Invalid or expired token' });
   }
 }
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// AUTH ROUTES
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function requireAdmin(req, res, next) {
+  if (req.user?.role !== 'admin')
+    return res.status(403).json({ message: 'Admin access required' });
+  next();
+}
 
-app.post('/api/auth/register', async (req, res) => {
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FIRST TIME SETUP — creates admin if none exists
+// Visit /api/setup in browser ONCE, then it locks itself
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+app.post('/api/setup', async (req, res) => {
+  try {
+    const adminExists = await User.findOne({ role: 'admin' });
+    if (adminExists)
+      return res.status(400).json({ message: 'Admin already exists. Setup locked.' });
+
+    const { username, password } = req.body;
+    if (!username || !password)
+      return res.status(400).json({ message: 'Username and password required' });
+
+    const admin = new User({ username, password, role: 'admin' });
+    await admin.save();
+
+    res.json({ message: `Admin "${username}" created successfully. Setup is now locked.` });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// AUTH ROUTES
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Login — works for both admin and agent
+app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password)
       return res.status(400).json({ message: 'Username and password required' });
-    const exists = await User.findOne({ username });
-    if (exists)
-      return res.status(400).json({ message: 'Username already taken' });
-    const hash = await bcrypt.hash(password, 10);
-    const user = await User.create({ username, password: hash, role: 'agent' });
+
+    const user = await User.findOne({ username: username.toLowerCase().trim() });
+
+    if (!user || !user.isActive)
+      return res.status(401).json({ message: 'Invalid username or password' });
+
+    const match = await user.comparePassword(password);
+    if (!match)
+      return res.status(401).json({ message: 'Invalid username or password' });
+
+    // Update last login
+    user.lastLogin = new Date();
+    await user.save();
+
     const token = jwt.sign(
       { id: user._id, username: user.username, role: user.role },
-      process.env.JWT_SECRET || 'umrah_jwt_secret',
+      JWT_SECRET,
       { expiresIn: '7d' }
     );
+
     res.json({ token, username: user.username, role: user.role });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// TEAM MANAGEMENT — admin only
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Get all agents
+app.get('/api/team', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const agents = await User.find({ role: 'agent' })
+      .select('-password')
+      .sort({ createdAt: -1 });
+    res.json(agents);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Create a new agent — admin only, no public signup
+app.post('/api/team', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { username, password } = req.body;
-    const user = await User.findOne({ username });
-    if (!user || !(await bcrypt.compare(password, user.password)))
-      return res.status(401).json({ message: 'Wrong username or password' });
-    const token = jwt.sign(
-      { id: user._id, username: user.username, role: user.role },
-      process.env.JWT_SECRET || 'umrah_jwt_secret',
-      { expiresIn: '7d' }
-    );
-    res.json({ token, username: user.username, role: user.role });
+    if (!username || !password)
+      return res.status(400).json({ message: 'Username and password required' });
+
+    const exists = await User.findOne({ username: username.toLowerCase() });
+    if (exists)
+      return res.status(400).json({ message: 'Username already taken' });
+
+    const agent = new User({
+      username,
+      password,
+      role:      'agent',
+      createdBy: req.user.username
+    });
+    await agent.save();
+
+    res.json({ message: 'Agent created', username: agent.username });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// DASHBOARD API ROUTES
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Toggle agent active/inactive (soft delete)
+app.patch('/api/team/:username', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const user = await User.findOne({ username: req.params.username, role: 'agent' });
+    if (!user) return res.status(404).json({ message: 'Agent not found' });
 
-// GET /api/stats — summary numbers for the dashboard home
+    user.isActive = !user.isActive;
+    await user.save();
+
+    res.json({ message: `Agent ${user.isActive ? 'activated' : 'deactivated'}`, isActive: user.isActive });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Reset agent password — admin only
+app.post('/api/team/:username/reset-password', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { newPassword } = req.body;
+    if (!newPassword) return res.status(400).json({ message: 'New password required' });
+
+    const user = await User.findOne({ username: req.params.username, role: 'agent' });
+    if (!user) return res.status(404).json({ message: 'Agent not found' });
+
+    user.password = newPassword;  // pre-save hook hashes it
+    await user.save();
+
+    res.json({ message: 'Password reset successfully' });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DASHBOARD API — both admin and agent can access
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 app.get('/api/stats', requireAuth, async (req, res) => {
   try {
-    const total    = await Activity.countDocuments();
-    const paused   = await Activity.countDocuments({ isPaused: true });
-    const active   = await Activity.countDocuments({ isPaused: false });
-    const today    = new Date(); today.setHours(0,0,0,0);
+    const total  = await Activity.countDocuments();
+    const paused = await Activity.countDocuments({ isPaused: true });
+    const today  = new Date(); today.setHours(0,0,0,0);
     const newToday = await Activity.countDocuments({ firstSeen: { $gte: today } });
-    const msgSum   = await Activity.aggregate([
+    const msgAgg = await Activity.aggregate([
       { $group: { _id: null, total: { $sum: '$messageCount' } } }
     ]);
     res.json({
       totalCustomers: total,
-      activeChats:    active,
+      activeChats:    total - paused,
       pausedChats:    paused,
-      newToday:       newToday,
-      totalMessages:  msgSum[0]?.total || 0
+      newToday,
+      totalMessages:  msgAgg[0]?.total || 0
     });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// GET /api/customers — list all customers, sorted by last active
+// List all customers — sorted by last active
 app.get('/api/customers', requireAuth, async (req, res) => {
   try {
     const customers = await Activity.find()
@@ -115,7 +211,7 @@ app.get('/api/customers', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/customers/:phone — full conversation for one customer
+// Get one customer's full conversation
 app.get('/api/customers/:phone', requireAuth, async (req, res) => {
   try {
     const customer = await Activity.findOne({ phoneNumber: req.params.phone });
@@ -126,7 +222,7 @@ app.get('/api/customers/:phone', requireAuth, async (req, res) => {
   }
 });
 
-// PATCH /api/customers/:phone — update customer name or status
+// Update customer name/status
 app.patch('/api/customers/:phone', requireAuth, async (req, res) => {
   try {
     const { customerName, status } = req.body;
@@ -141,12 +237,17 @@ app.patch('/api/customers/:phone', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/customers/:phone/pause — agent takes over, bot stops
+// Pause bot — agent takes over
 app.post('/api/customers/:phone/pause', requireAuth, async (req, res) => {
   try {
     const updated = await Activity.findOneAndUpdate(
       { phoneNumber: req.params.phone },
-      { $set: { isPaused: true, pausedBy: req.user.username, pausedAt: new Date(), status: 'paused' } },
+      { $set: {
+          isPaused: true,
+          pausedBy: req.user.username,
+          pausedAt: new Date(),
+          status:   'paused'
+      }},
       { new: true }
     );
     console.log(`⏸️  Bot paused for ${req.params.phone} by ${req.user.username}`);
@@ -156,12 +257,17 @@ app.post('/api/customers/:phone/pause', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/customers/:phone/resume — hand back to bot
+// Resume bot — hand back to AI
 app.post('/api/customers/:phone/resume', requireAuth, async (req, res) => {
   try {
     const updated = await Activity.findOneAndUpdate(
       { phoneNumber: req.params.phone },
-      { $set: { isPaused: false, pausedBy: null, pausedAt: null, status: 'active' } },
+      { $set: {
+          isPaused: false,
+          pausedBy: null,
+          pausedAt: null,
+          status:   'active'
+      }},
       { new: true }
     );
     console.log(`▶️  Bot resumed for ${req.params.phone} by ${req.user.username}`);
@@ -171,34 +277,34 @@ app.post('/api/customers/:phone/resume', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/customers/:phone/reply — agent sends a manual WhatsApp message
+// Agent sends manual reply
 app.post('/api/customers/:phone/reply', requireAuth, async (req, res) => {
   try {
     const { message } = req.body;
-    if (!message) return res.status(400).json({ message: 'Message required' });
+    if (!message?.trim())
+      return res.status(400).json({ message: 'Message cannot be empty' });
 
-    // Send via WhatsApp API
     await sendTextMessage(req.params.phone, message);
 
-    // Save to conversation thread
     await Activity.findOneAndUpdate(
       { phoneNumber: req.params.phone },
       {
         $push: { messages: { role: 'agent', content: message } },
-        $set:  { lastMessage: message, lastActive: new Date() },
+        $set:  { lastMessage: message.substring(0,80), lastActive: new Date() },
         $inc:  { messageCount: 1 }
       }
     );
-    console.log(`👤 Agent ${req.user.username} replied to ${req.params.phone}: ${message}`);
+
+    console.log(`👤 ${req.user.username} replied to ${req.params.phone}`);
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // WHATSAPP WEBHOOK
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 app.get('/webhook', (req, res) => {
   const mode      = req.query['hub.mode'];
@@ -212,12 +318,10 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// Deduplication set — prevents double replies if Meta retries
 const processedMessages = new Set();
 
 app.post('/webhook', (req, res) => {
-  // Always reply 200 immediately so Meta never retries
-  res.sendStatus(200);
+  res.sendStatus(200); // Always reply immediately
 
   setImmediate(async () => {
     try {
@@ -228,12 +332,12 @@ app.post('/webhook', (req, res) => {
       const message = value.messages[0];
       const from    = message.from;
 
-      // Dedup check
+      // Deduplicate — Meta sometimes sends the same message twice
       if (processedMessages.has(message.id)) return;
       processedMessages.add(message.id);
       setTimeout(() => processedMessages.delete(message.id), 10 * 60 * 1000);
 
-      // Only handle text
+      // Non-text messages
       if (message.type !== 'text') {
         await sendTextMessage(from, 'I can read text messages only. Please type your question 😊');
         return;
@@ -242,80 +346,82 @@ app.post('/webhook', (req, res) => {
       const incomingText = message.text.body.trim();
       console.log(`\n📩 From ${from}: "${incomingText}"`);
 
-      // ── Check if bot is paused for this customer ──────────────────────────
-      const customerRecord = await Activity.findOne({ phoneNumber: from });
-      if (customerRecord?.isPaused) {
-        console.log(`⏸️  Bot is paused for ${from} — message saved, not replying`);
-        // Still save the message so agent can see it
+      // Check if agent has paused this customer
+      const existing = await Activity.findOne({ phoneNumber: from });
+      if (existing?.isPaused) {
+        console.log(`⏸️  Agent handling ${from} — saving message silently`);
         await Activity.findOneAndUpdate(
           { phoneNumber: from },
           {
             $push: { messages: { role: 'user', content: incomingText } },
-            $set:  { lastMessage: incomingText, lastActive: new Date() },
+            $set:  { lastMessage: incomingText.substring(0,80), lastActive: new Date() },
             $inc:  { messageCount: 1 }
           }
         );
-        return; // Agent is handling — bot stays silent
+        return; // Bot stays silent — agent is handling
       }
 
-      // ── Escalation keywords ───────────────────────────────────────────────
-      const escalationKeywords = [
+      // Escalation keywords — auto-pause and alert
+      const escalationWords = [
         'agent','human','manager','complaint','refund',
         'urgent','problem','انسان','شکایت','فوری','مسئلہ'
       ];
-      const needsHuman = escalationKeywords.some(
-        kw => incomingText.toLowerCase().includes(kw)
-      );
-
-      if (needsHuman) {
+      if (escalationWords.some(w => incomingText.toLowerCase().includes(w))) {
         await sendTextMessage(from,
           'I understand you need immediate help. Connecting you with our team now.\n\n' +
           '📞 +92-300-1234567\n🕐 Mon–Sat, 9am–7pm PKT'
         );
-        // Auto-pause bot and flag for agent
         await Activity.findOneAndUpdate(
           { phoneNumber: from },
           {
             $push: { messages: { role: 'user', content: incomingText } },
-            $set:  { isPaused: true, pausedBy: 'auto-escalation', status: 'paused',
-                     lastMessage: incomingText, lastActive: new Date() },
-            $inc:  { messageCount: 1 }
+            $set:  {
+              isPaused:    true,
+              pausedBy:    'auto-escalation',
+              status:      'paused',
+              lastMessage: incomingText.substring(0,80),
+              lastActive:  new Date()
+            },
+            $inc: { messageCount: 1 }
           },
           { upsert: true }
         );
         return;
       }
 
-      // ── Get conversation history for this customer ────────────────────────
-      const history = (customerRecord?.messages || [])
+      // Build conversation history for AI
+      const history = (existing?.messages || [])
         .slice(-20)
-        .map(m => ({ role: m.role === 'bot' ? 'assistant' : 'user', content: m.content }));
+        .map(m => ({
+          role:    m.role === 'bot' ? 'assistant' : 'user',
+          content: m.content
+        }));
 
-      // ── Get AI reply ──────────────────────────────────────────────────────
+      // Get AI response
       const start   = Date.now();
       const aiReply = await getAIResponse(history, incomingText);
       const elapsed = Date.now() - start;
 
-      // ── Save both messages to MongoDB ─────────────────────────────────────
+      // Save both messages to MongoDB — upsert creates record if new customer
       await Activity.findOneAndUpdate(
         { phoneNumber: from },
         {
           $push: { messages: { $each: [
-            { role: 'user',  content: incomingText },
-            { role: 'bot',   content: aiReply }
+            { role: 'user', content: incomingText },
+            { role: 'bot',  content: aiReply }
           ]}},
           $set: {
-            lastMessage:  aiReply.substring(0, 80),
-            lastActive:   new Date(),
-            status:       'active',
+            lastMessage:           aiReply.substring(0,80),
+            lastActive:            new Date(),
+            status:                'active',
             'metadata.responseTime': elapsed
           },
-          $inc: { messageCount: 2 }
+          $inc:        { messageCount: 2 },
+          $setOnInsert: { firstSeen: new Date() }
         },
         { upsert: true, new: true }
       );
 
-      // ── Send reply to customer ────────────────────────────────────────────
       await sendTextMessage(from, aiReply);
       console.log(`✅ Replied to ${from} in ${elapsed}ms`);
 
@@ -327,20 +433,17 @@ app.post('/webhook', (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({
-  status: 'running',
-  bot: 'Umrah Travel Bot',
-  ai: process.env.AI_PROVIDER || 'gemini',
-  uptime: `${Math.floor(process.uptime())}s`
+  status:  'running',
+  bot:     'Umrah Travel Bot',
+  ai:      process.env.AI_PROVIDER || 'gemini',
+  uptime:  `${Math.floor(process.uptime())}s`
 }));
 
-// ── Serve dashboard for all other routes ──────────────────────────────────────
-// ── Serve dashboard for all other routes ──────────────────────────────────────
-// ── Serve dashboard for all other routes ──────────────────────────────────────
-app.get(/(.*)/, (req, res) => {
+// Serve dashboard for all other routes
+app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'dashboard/frontend/index.html'));
 });
 
-// ── Start server ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
