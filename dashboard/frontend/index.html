@@ -344,10 +344,19 @@ function bootApp() {
   document.getElementById('top-username').textContent  = userName;
   document.getElementById('top-role').textContent      = userRole;
 
-  // Show admin tab only for admins
+  // Show Team tab for admin
   if (userRole === 'admin') {
-    document.getElementById('tab-admin').style.display = '';
-    document.querySelectorAll('.admin-only').forEach(el => el.style.display = '');
+    const adminTab = document.getElementById('tab-admin');
+    if (adminTab) {
+      adminTab.style.display      = 'block';
+      adminTab.style.removeProperty = undefined; // clear any inline hidden
+    }
+    document.querySelectorAll('.admin-only').forEach(el => {
+      el.style.display = 'block';
+    });
+    console.log('✅ Admin mode activated — Team tab shown');
+  } else {
+    console.log('ℹ️ Agent mode — Team tab hidden');
   }
 
   loadStats();
