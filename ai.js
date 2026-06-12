@@ -50,14 +50,17 @@ async function getAIResponse(conversationHistory, newUserMessage) {
   }
 }
 
-// ── Gemini response function ──────────────────────────────────────────────────
 async function askGemini(history, userMessage) {
-  // Start a chat session with the existing conversation history
+  // Safety: ensure history starts with user role
+  let safeHistory = [...history];
+  while (safeHistory.length > 0 && safeHistory[0].role !== 'user') {
+    safeHistory.shift();
+  }
+
   const chat = geminiModel.startChat({
-    history: convertHistoryForGemini(history)
+    history: convertHistoryForGemini(safeHistory)
   });
 
-  // Send the new message and wait for response
   const result = await chat.sendMessage(userMessage);
   const response = await result.response;
   const text = response.text();
