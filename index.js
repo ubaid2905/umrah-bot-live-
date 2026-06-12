@@ -389,20 +389,20 @@ app.post('/webhook', (req, res) => {
         return;
       }
 
-     // Build history for AI
-let history = (patient.messages || []).slice(-30).map(m => ({
-  role:    m.role === 'bot' ? 'assistant' : 'user',
-  content: m.content
-}));
+     // Build conversation history for AI
+let history = (patient?.messages || [])
+  .slice(-20)
+  .map(m => ({
+    role:    m.role === 'bot' ? 'assistant' : 'user',
+    content: m.content
+  }));
 
-// Gemini requires history to start with role 'user' — remove
-// any leading assistant/bot messages before the first user message
+// Gemini requires history to start with user role
 while (history.length > 0 && history[0].role !== 'user') {
   history.shift();
 }
 
-// Also remove any consecutive duplicate roles which Gemini rejects
-// (user, user) or (assistant, assistant) back to back
+// Remove consecutive same roles
 history = history.filter((msg, i) => {
   if (i === 0) return true;
   return msg.role !== history[i - 1].role;
