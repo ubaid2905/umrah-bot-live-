@@ -390,7 +390,7 @@ app.post('/webhook', (req, res) => {
       }
 
      // Build conversation history for AI
-let history = (patient?.messages || [])
+let history = (existing?.messages || [])
   .slice(-20)
   .map(m => ({
     role:    m.role === 'bot' ? 'assistant' : 'user',
